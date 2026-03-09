@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	unixproxy "unixproxy-go"
+	"github.com/wdsgyj/unixproxy-go"
 )
 
 func main() {
