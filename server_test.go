@@ -253,6 +253,64 @@ func TestUnixSocketProxyOriginFormUsesForwardedProto(t *testing.T) {
 	}
 }
 
+func TestUnixSocketProxyOriginFormDefaultsToHTTPS(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("origin-form-https"))
+	}))
+	defer upstream.Close()
+
+	baseTransport := upstream.Client().Transport.(*http.Transport).Clone()
+	baseTransport.Proxy = nil
+	baseTransport.ForceAttemptHTTP2 = false
+
+	socketPath := newSocketPath(t)
+	proxy := NewServer(socketPath, WithClientFactory(func() *http.Client {
+		transport := baseTransport.Clone()
+		transport.TLSClientConfig = cloneTLSConfig(transport.TLSClientConfig)
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+		}
+		return &http.Client{Transport: transport}
+	}))
+
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+	proxy.RegisterTraceListener(TraceListenerFunc(func(event TraceEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}))
+
+	runServer(t, proxy)
+
+	host := strings.TrimPrefix(upstream.URL, "https://")
+	rawReq := strings.Join([]string{
+		"GET /path HTTP/1.1",
+		"Host: " + host,
+		"Connection: close",
+		"",
+		"",
+	}, "\r\n")
+
+	resp, body := sendRawRequest(t, socketPath, rawReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	if body != "origin-form-https" {
+		t.Fatalf("unexpected response body: %q", body)
+	}
+
+	event := waitForSingleEvent(t, &mu, &events)
+	if event.URL != upstream.URL+"/path" {
+		t.Fatalf("unexpected trace url: %s", event.URL)
+	}
+	if event.TLS == nil {
+		t.Fatalf("expected tls info for default https origin-form request")
+	}
+}
+
 func TestServerReusesHTTPClientAndConnection(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("reuse"))

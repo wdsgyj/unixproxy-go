@@ -449,7 +449,7 @@ func normalizeRequestURL(req *http.Request) (*url.URL, error) {
 
 	scheme := strings.ToLower(strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")))
 	if scheme == "" {
-		scheme = "http"
+		scheme = "https"
 	}
 	if scheme != "http" && scheme != "https" {
 		return nil, errUnsupportedScheme
@@ -859,7 +859,7 @@ func traceURLFromRequest(req *http.Request) string {
 		target.Host = req.Host
 		scheme := strings.ToLower(strings.TrimSpace(req.Header.Get("X-Forwarded-Proto")))
 		if scheme == "" {
-			scheme = "http"
+			scheme = "https"
 		}
 		target.Scheme = scheme
 	}
