@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/http/httputil"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -163,6 +164,8 @@ type Server struct {
 	traceListeners map[uint64]TraceListener
 	nextTraceID    uint64
 	nextRequestID  atomic.Uint64
+
+	Debug bool
 }
 
 func NewServer(socketPath string, opts ...Option) *Server {
@@ -290,9 +293,10 @@ func (s *Server) serveConn(conn net.Conn) {
 	for {
 		req, err := http.ReadRequest(reader)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-				return
-			}
+			// 提前关闭或者提前 EOF 都要返回错误 response 提醒
+			//if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			//	return
+			//}
 
 			s.writeErrorResponse(conn, http.StatusBadRequest, err)
 			return
@@ -374,8 +378,7 @@ func (s *Server) handleRequest(conn net.Conn, incoming *http.Request) error {
 
 	trace.setStatusCode(resp.StatusCode)
 
-	removeHopByHopHeaders(resp.Header)
-	resp.Request = nil
+	resp = normalizeOutgoingResponse(resp, incoming.Method)
 
 	writer := &countingWriter{writer: conn}
 	if err := resp.Write(writer); err != nil {
@@ -416,12 +419,24 @@ func buildOutgoingRequest(incoming *http.Request, targetURL *url.URL, ctx contex
 	removeHopByHopHeaders(outReq.Header)
 
 	outReq.Host = incoming.Host
-	outReq.ContentLength = incoming.ContentLength
-	outReq.TransferEncoding = append([]string(nil), incoming.TransferEncoding...)
 	outReq.Trailer = cloneHeader(incoming.Trailer)
-	outReq.Proto = incoming.Proto
-	outReq.ProtoMajor = incoming.ProtoMajor
-	outReq.ProtoMinor = incoming.ProtoMinor
+	if len(outReq.Trailer) == 0 {
+		outReq.Trailer = nil
+	}
+
+	// Client requests let net/http choose the wire protocol and body framing.
+	outReq.Proto = ""
+	outReq.ProtoMajor = 0
+	outReq.ProtoMinor = 0
+	outReq.TransferEncoding = nil
+	switch {
+	case getBody == nil:
+		outReq.ContentLength = 0
+	case outReq.Trailer != nil:
+		outReq.ContentLength = -1
+	default:
+		outReq.ContentLength = int64(len(bodyBytes))
+	}
 	outReq.RequestURI = ""
 
 	return outReq, nil
@@ -465,11 +480,12 @@ func normalizeRequestURL(req *http.Request) (*url.URL, error) {
 func (s *Server) buildHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	transport.ForceAttemptHTTP2 = false
-	transport.TLSClientConfig = cloneTLSConfig(transport.TLSClientConfig)
+	transport.ForceAttemptHTTP2 = true
 	if s.transportConfig != nil {
 		s.transportConfig(transport)
 	}
+	transport.TLSClientConfig = cloneTLSConfig(transport.TLSClientConfig)
+	normalizeTransportALPN(transport)
 
 	client := &http.Client{
 		Transport: transport,
@@ -514,6 +530,106 @@ func cloneTLSConfig(cfg *tls.Config) *tls.Config {
 		return nil
 	}
 	return cfg.Clone()
+}
+
+func normalizeOutgoingResponse(resp *http.Response, requestMethod string) *http.Response {
+	if resp == nil {
+		return nil
+	}
+
+	normalized := new(http.Response)
+	*normalized = *resp
+	normalized.Header = cloneHeader(resp.Header)
+	removeHopByHopHeaders(normalized.Header)
+	normalized.Trailer = cloneHeader(resp.Trailer)
+	if len(normalized.Trailer) == 0 {
+		normalized.Trailer = nil
+	}
+
+	normalized.Proto = "HTTP/1.1"
+	normalized.ProtoMajor = 1
+	normalized.ProtoMinor = 1
+	normalized.Request = &http.Request{Method: requestMethod}
+	if len(resp.TransferEncoding) > 0 {
+		normalized.TransferEncoding = append([]string(nil), resp.TransferEncoding...)
+	} else {
+		normalized.TransferEncoding = nil
+	}
+
+	bodyAllowed := responseBodyAllowedForMethodAndStatus(requestMethod, normalized.StatusCode)
+	if !bodyAllowed {
+		normalized.TransferEncoding = nil
+		normalized.Trailer = nil
+		return normalized
+	}
+
+	if normalized.Trailer != nil || (normalized.ContentLength < 0 && len(normalized.TransferEncoding) == 0) {
+		normalized.ContentLength = -1
+		normalized.TransferEncoding = []string{"chunked"}
+		normalized.Close = false
+	}
+
+	return normalized
+}
+
+func responseBodyAllowedForMethodAndStatus(method string, statusCode int) bool {
+	if method == http.MethodHead {
+		return false
+	}
+	if statusCode >= 100 && statusCode <= 199 {
+		return false
+	}
+	return statusCode != http.StatusNoContent && statusCode != http.StatusNotModified
+}
+
+func normalizeTransportALPN(transport *http.Transport) {
+	if transport == nil || transport.TLSClientConfig == nil {
+		return
+	}
+	if transportSupportsHTTP2(transport) {
+		return
+	}
+	transport.TLSClientConfig.NextProtos = removeNextProto(
+		transport.TLSClientConfig.NextProtos,
+		"h2",
+	)
+}
+
+func transportSupportsHTTP2(transport *http.Transport) bool {
+	if transport == nil {
+		return false
+	}
+	if transport.Protocols != nil {
+		return transport.Protocols.HTTP2()
+	}
+	if transport.TLSNextProto != nil {
+		return transport.TLSNextProto["h2"] != nil
+	}
+	if transport.ForceAttemptHTTP2 {
+		return true
+	}
+	return transport.TLSClientConfig == nil &&
+		transport.Dial == nil &&
+		transport.DialContext == nil &&
+		transport.DialTLS == nil &&
+		transport.DialTLSContext == nil
+}
+
+func removeNextProto(protocols []string, target string) []string {
+	if len(protocols) == 0 {
+		return protocols
+	}
+	filtered := protocols[:0]
+	for _, protocol := range protocols {
+		if protocol == target {
+			continue
+		}
+		filtered = append(filtered, protocol)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
 }
 
 func (s *Server) emitTrace(event TraceEvent) {
@@ -1054,4 +1170,30 @@ func removeHopByHopHeaders(header http.Header) {
 	} {
 		header.Del(field)
 	}
+}
+
+func dumpRequest(req *http.Request) (*http.Request, []byte) {
+	dump, err := httputil.DumpRequest(req, true)
+	if err != nil {
+		panic(err)
+	}
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		panic(err)
+	}
+	req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	return req, dump
+}
+
+func dumpResponse(resp *http.Response) (*http.Response, []byte) {
+	dump, err := httputil.DumpResponse(resp, true)
+	if err != nil {
+		panic(err)
+	}
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		panic(err)
+	}
+	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	return resp, dump
 }

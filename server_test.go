@@ -2,6 +2,7 @@ package unixproxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -205,6 +206,198 @@ func TestUnixSocketProxyTraceEventForHTTPS(t *testing.T) {
 	}
 	if event.StatusCode == nil || *event.StatusCode != http.StatusOK {
 		t.Fatalf("unexpected status code in trace: %#v", event.StatusCode)
+	}
+}
+
+func TestUnixSocketProxyPrefersHTTP2WhenUpstreamSupportsIt(t *testing.T) {
+	var (
+		gotProto string
+		gotBody  string
+	)
+
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read upstream body: %v", err)
+		}
+
+		gotProto = r.Proto
+		gotBody = string(body)
+		_, _ = w.Write([]byte("ok-h2"))
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	socketPath := newSocketPath(t)
+	proxy := NewServer(socketPath, WithTransportConfig(func(transport *http.Transport) {
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
+		}
+	}))
+
+	var (
+		mu     sync.Mutex
+		events []TraceEvent
+	)
+	proxy.RegisterTraceListener(TraceListenerFunc(func(event TraceEvent) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}))
+
+	runServer(t, proxy)
+
+	targetURL := upstream.URL + "/secure-h2"
+	rawReq := strings.Join([]string{
+		fmt.Sprintf("POST %s HTTP/1.1", targetURL),
+		strings.TrimPrefix(upstream.URL, "https://"),
+		"Content-Type: text/plain",
+		"Content-Length: 5",
+		"Connection: close",
+		"",
+		"hello",
+	}, "\r\n")
+
+	resp, body := sendRawRequest(t, socketPath, rawReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	if resp.Proto != "HTTP/1.1" {
+		t.Fatalf("expected proxied response HTTP/1.1, got %q", resp.Proto)
+	}
+	if body != "ok-h2" {
+		t.Fatalf("unexpected response body: %q", body)
+	}
+	if gotProto != "HTTP/2.0" {
+		t.Fatalf("expected upstream HTTP/2, got %q", gotProto)
+	}
+	if gotBody != "hello" {
+		t.Fatalf("unexpected upstream body: %q", gotBody)
+	}
+
+	event := waitForSingleEvent(t, &mu, &events)
+	if event.Error != nil {
+		t.Fatalf("unexpected trace error: %v", event.Error)
+	}
+	if event.TLS == nil {
+		t.Fatalf("expected tls info")
+	}
+	if event.TLS.NegotiatedProtocol != "h2" {
+		t.Fatalf("expected negotiated protocol h2, got %q", event.TLS.NegotiatedProtocol)
+	}
+}
+
+func TestUnixSocketProxyRewritesHTTP2StreamingResponseToHTTP11Chunked(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("expected flusher")
+		}
+
+		_, _ = w.Write([]byte("hello "))
+		flusher.Flush()
+		_, _ = w.Write([]byte("stream"))
+	}))
+	upstream.EnableHTTP2 = true
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	socketPath := newSocketPath(t)
+	proxy := NewServer(socketPath, WithTransportConfig(func(transport *http.Transport) {
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
+		}
+	}))
+
+	runServer(t, proxy)
+
+	targetURL := upstream.URL + "/stream"
+	rawReq := strings.Join([]string{
+		fmt.Sprintf("GET %s HTTP/1.1", targetURL),
+		strings.TrimPrefix(upstream.URL, "https://"),
+		"Connection: keep-alive",
+		"",
+		"",
+	}, "\r\n")
+
+	resp, body := sendRawRequest(t, socketPath, rawReq)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	if resp.Proto != "HTTP/1.1" {
+		t.Fatalf("expected proxied response HTTP/1.1, got %q", resp.Proto)
+	}
+	if len(resp.TransferEncoding) != 1 || resp.TransferEncoding[0] != "chunked" {
+		t.Fatalf("expected chunked proxied response, got %#v", resp.TransferEncoding)
+	}
+	if body != "hello stream" {
+		t.Fatalf("unexpected response body: %q", body)
+	}
+}
+
+func TestBuildOutgoingRequestClearsInboundHTTP11TransportHints(t *testing.T) {
+	rawReq := strings.Join([]string{
+		"POST /upload HTTP/1.1",
+		"Host: example.com",
+		"X-Forwarded-Proto: https",
+		"Transfer-Encoding: chunked",
+		"Trailer: X-Checksum",
+		"",
+		"5",
+		"hello",
+		"0",
+		"X-Checksum: abc123",
+		"",
+		"",
+	}, "\r\n")
+
+	incoming, err := http.ReadRequest(bufio.NewReader(strings.NewReader(rawReq)))
+	if err != nil {
+		t.Fatalf("read request: %v", err)
+	}
+	defer incoming.Body.Close()
+
+	bodyBytes, err := io.ReadAll(incoming.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+
+	targetURL, err := normalizeRequestURL(incoming)
+	if err != nil {
+		t.Fatalf("normalize request url: %v", err)
+	}
+
+	outReq, err := buildOutgoingRequest(incoming, targetURL, context.Background(), bodyBytes)
+	if err != nil {
+		t.Fatalf("build outgoing request: %v", err)
+	}
+	defer outReq.Body.Close()
+
+	if outReq.Proto != "" || outReq.ProtoMajor != 0 || outReq.ProtoMinor != 0 {
+		t.Fatalf("expected outbound proto to be transport-selected, got %q %d.%d", outReq.Proto, outReq.ProtoMajor, outReq.ProtoMinor)
+	}
+	if len(outReq.TransferEncoding) != 0 {
+		t.Fatalf("expected outbound transfer encoding to be cleared, got %#v", outReq.TransferEncoding)
+	}
+	if outReq.ContentLength != -1 {
+		t.Fatalf("expected outbound content length -1 for trailers, got %d", outReq.ContentLength)
+	}
+	if outReq.Trailer.Get("X-Checksum") != "abc123" {
+		t.Fatalf("unexpected outbound trailer: %#v", outReq.Trailer)
+	}
+	if outReq.Header.Get("Trailer") != "" {
+		t.Fatalf("expected Trailer header to be removed from outbound headers, got %#v", outReq.Header)
+	}
+
+	outBody, err := io.ReadAll(outReq.Body)
+	if err != nil {
+		t.Fatalf("read outbound body: %v", err)
+	}
+	if string(outBody) != "hello" {
+		t.Fatalf("unexpected outbound body: %q", outBody)
 	}
 }
 
@@ -418,6 +611,9 @@ func TestServerBuildsDefaultClientWithOptions(t *testing.T) {
 	}
 	if transport.ResponseHeaderTimeout != 150*time.Millisecond {
 		t.Fatalf("unexpected response header timeout: %s", transport.ResponseHeaderTimeout)
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatalf("expected transport to prefer http2")
 	}
 	if client.CheckRedirect == nil {
 		t.Fatalf("expected custom redirect hook")
